@@ -219,28 +219,10 @@ class CiviCRM_Caldera_Forms_Order_Processor {
 			$form_values = array_merge( $form_values, $metadata );
 		}
 
-		try {
-			$create_order = civicrm_api3( 'Order', 'create', $form_values );
-
-			$this->order = ( $create_order['count'] && ! $create_order['is_error'] ) ? $create_order['values'][$create_order['id']] : false;
-
-			// create product
-			if ( isset( $form_values['product_id'] ) ) {
-				$params = [
-					'product_id' => $form_values['product_id'],
-					'contribution_id' => $create_order['id'],
-					'quantity' => 1 // FIXME, can this be set via UI?
-				];
-
-				if ( isset( $transdata['data'][$config['product_id'] . '_option'] ) )
-					$params['product_option'] = $transdata['data'][$config['product_id'] . '_option'];
-				
-				$create_premium = civicrm_api3( 'ContributionProduct', 'create', $params );
-				
-			}
-		} catch ( CiviCRM_API3_Exception $e ) {
-			$transdata['error'] = true;
-			$transdata['note'] = $e->getMessage() . '<br><br><pre' . $e->getTraceAsString() . '</pre>';
+		if ( $this->has_participant( $form_values ) ) {
+			$create_order = $this->process_participant_order( $form_values, $config );
+		} else {
+			$create_order = $this->process_order( $form_values, $config );
 		}
 
 		// return order_id magic tag
@@ -264,7 +246,18 @@ class CiviCRM_Caldera_Forms_Order_Processor {
 		$transient = $this->plugin->transient->get();
 
 		// preserve join dates 
-		$this->preserve_membership_join_date( $config, $form, $processid );
+		$this->preserve_membership_join_date( $form );
+
+		$line_items = civicrm_api3( 'LineItem', 'get', [
+				'contribution_id' => $this->order['id']
+			] );
+
+		$this->order = array_merge( $this->order, [ 'line_items' => $line_items['values'] ] );
+
+		$this->track_cividiscounts( $this->order );
+
+		// send confirmation/receipt
+		$this->maybe_send_confirmation( $this->order, $config );
 
 		if ( true ) { //$config['is_thank_you'] ) {
 			add_filter( 'caldera_forms_ajax_return', function( $out, $_form ) use ( $transdata, $transient ){
@@ -297,106 +290,243 @@ class CiviCRM_Caldera_Forms_Order_Processor {
 			}, 10, 2 );
 		}
 
-		// send confirmation/receipt 
-		$this->maybe_send_confirmation( $this->order, $config );
 
-		if ( $this->order ) {
+		/**
+		 * Runs when Order processor is post_processed if an order has been created.
+		 *
+		 * @since 1.0
+		 * @param array|bool $order The created order result, or false
+		 * @param array $config The processor config
+		 * @param array $form The form config
+		 * @param string $processid The process id
+		 */
+		do_action( 'cfc_order_post_processor', $this->order, $config, $form, $processid );
 
-			$line_items = civicrm_api3( 'LineItem', 'get', [
-				'contribution_id' => $this->order['id']
-			] );
+	}
 
-			$order = array_merge( $this->order, [ 'line_items' => $line_items['values'] ] );
+	/**
+	 * Process order.
+	 *
+	 * @since 1.0
+	 * @param array $form_values The submitted form values
+	 * @param  [type] $config      [description]
+	 * @return [type]              [description]
+	 */
+	public function process_order( $form_values, $config ) {
 
-			// FIXME
-			// figure out a better way to handle this
-			// although here's the only place where we know if we have participants or not
-			// 
-			// record/track cividiscounts
-			if ( isset( $this->plugin->cividiscount ) && ! empty( $this->plugin->processors->processors['participant']->discounts_used ) && ( ! empty( $this->plugin->processors->processors['participant']->price_field_refs  ) || ! empty( $this->plugin->processors->processors['participant']->price_field_option_refs ) ) ) {
+		global $transdata;
 
-				$price_field_refs = $this->plugin->processors->processors['participant']->price_field_refs;
-				$price_field_option_refs = $this->plugin->processors->processors['participant']->price_field_option_refs;
-				$discounts_used = $this->plugin->processors->processors['participant']->discounts_used;
+		if ( ! is_array( $form_values ) ) return;
 
-				$price_field_option_refs = array_reduce( $price_field_option_refs, function( $refs, $ref ) {
-					$refs[$ref['processor_id']] = $ref['field_id'];
-					return $refs;
-				}, [] );
+		try {
 
-				$participant_ids = array_reduce( $order['line_items'], function( $ids, $item ) {
-					if ( $item['entity_table'] == 'civicrm_participant' ) {
-						$ids[] = $item['entity_id'];
-					}
-					return $ids;
-				}, [] );
+			$order = civicrm_api3( 'Order', 'create', $form_values );
 
-				$participant_items = array_reduce( $order['line_items'], function( $items, $item ) {
-					if ( $item['entity_table'] == 'civicrm_participant' ) {
-						$items[$item['entity_id']] = $item;
-					}
-					return $items;
-				}, [] );
+			$this->order = ( $order['count'] && ! $order['is_error'] ) ? $order['values'][$order['id']] : false;
 
-				$participants = civicrm_api3( 'Participant', 'get', [
-					'id' => [ 'IN' => $participant_ids ],
-					'options' => [ 'limit' => 0 ]
-				] );
+			$this->create_premium( $form_values, $config );
 
-				$participants = array_reduce( $participants['values'], function( $participants, $participant ) {
-					$participants[] = $participant;
-					return $participants;
-				}, [] );
+		} catch ( CiviCRM_API3_Exception $e ) {
+			$transdata['error'] = true;
+			$transdata['note'] = $e->getMessage() . '<br><br><pre' . $e->getTraceAsString() . '</pre>';
+		}
+	}
 
-				$refs = array_merge( $price_field_refs, $price_field_option_refs );
+	public function process_participant_order( $form_values, $config ) {
 
-				array_map( function( $processor_id, $field_id ) use ( $discounts_used, $transient, $order, $participants, $participant_items ) {
+		global $transdata;
 
-					$discount = isset( $discounts_used[$field_id] ) ? $discounts_used[$field_id] : false;
+		if ( ! is_array( $form_values ) ) return;
 
-					if ( ! $discount ) return;
+		$primary_participant_id = false;
 
-					$processor_id = $this->plugin->processors->processors['participant']->parse_processor_id( $processor_id );
+		// process entities and format line items
+		$line_items = array_reduce( $form_values['line_items'], function( $line_items, $line_item ) use ( &$primary_participant_id ) {
 
-					$event_id = $transient->events->$processor_id->event_id;
+			$item = [];
 
-					$participant = array_filter( $participants, function( $participant ) use ( $event_id ) {
-						return $participant['event_id'] == $event_id;
-					} );
+			if ( isset( $line_item['params'] ) ) {
+				$entity = civicrm_api3( str_replace( 'civicrm_', '', $line_item['line_item'][0]['entity_table'] ), 'create', $line_item['params'] );
+				$item['entity_id'] = $entity['id'];
 
-					$participant = array_pop( $participant );
-
-					if ( ! $participant ) return;
-
-					try {
-						$discount_track = civicrm_api3( 'DiscountTrack', 'create', [
-							'item_id' => $discount['id'],
-							'contact_id' => $order['contact_id'],
-							'contribution_id' => $order['id'],
-							'entity_table' => $participant_items[$participant['id']]['entity_table'],
-							'entity_id' => $participant['id'],
-							'description' => [ $participant_items[$participant['id']]['label'] ]
-						] );	
-					} catch ( CiviCRM_API3_Exception $e ) {
-						Civi::log()->debug( 'Unable to track discount ' . $discount['code'] . ' for contribution id ' . $order['id'] );
-					}
-
-				}, array_keys( $refs ), $refs );
+				if ( ! $primary_participant_id && $line_item['line_item'][0]['entity_table'] == 'civicrm_participant' )
+					$primary_participant_id = $entity['id'];
 			}
 
-			/**
-			 * Runs when Order processor is post_processed if an order has been created.
-			 *
-			 * @since 1.0
-			 * @param array $order The created order result
-			 * @param array $config The processor config
-			 * @param array $form The form config
-			 * @param string $processid The process id
-			 */
-			do_action( 'cfc_order_post_processor', $order, $config, $form, $processid );
+			unset( $line_item['params'] );
 
-		} 
+			// multiple choices price field
+			if ( count( $line_item['line_item'] ) > 1 ) {
+				foreach ( $line_item['line_item'] as $key => $sub_item ) {
+					$line_items[] = $sub_item; 
+				}
+			} else {
+				$line_items[] = array_merge( $line_item['line_item'][0], $item );
+			}
 
+			return $line_items;
+
+		}, [] );
+
+		$modified_line_items = array_reduce( $line_items, function( $line_items, $line_item ) use ( $primary_participant_id ) {
+
+			$line_item['entity_id'] = $primary_participant_id;
+			$line_item['entity_table'] = 'civicrm_participant';
+
+			$line_items[] = $line_item;
+
+			return $line_items;
+
+		}, [] );
+
+		// all price fields should be from the same price set, retrieve from the first index
+		$price_field = $this->plugin->helper->get_price_set_column_by_id( $line_items[0]['price_field_id'], 'price_field' );
+
+		$form_values['line_item'] = [ $price_field['price_set_id'] => $modified_line_items ];
+		$form_values['participant_id'] = $primary_participant_id;
+		$form_values['contribution_mode'] = 'participant';
+
+		unset( $form_values['line_items'] );
+
+		try {
+
+			$contribution = civicrm_api3( 'Contribution', 'create', $form_values );
+
+			$this->order = ( $contribution['count'] && ! $contribution['is_error'] ) ? $contribution['values'][$contribution['id']] : false;
+
+			if ( $this->order ) {
+				// create participant payment
+				$participant_payment = civicrm_api3( 'ParticipantPayment', 'create', [
+					'participant_id' => $primary_participant_id,
+					'contribution_id' => $contribution['id']
+				] );
+
+				$this->create_premium( $form_values, $config );
+			}
+
+		} catch ( CiviCRM_API3_Exception $e ) {
+			$transdata['error'] = true;
+			$transdata['note'] = $e->getMessage() . '<br><br><pre' . $e->getTraceAsString() . '</pre>';
+		}
+	}
+
+	/**
+	 * Create premium.
+	 *
+	 * @since 1.0
+	 * @param array $order The order/contribution
+	 * @param array $form_values The submitted form values
+	 * @param array $config The processor config
+	 */
+	public function create_premium( $form_values, $config ) {
+
+		global $transdata;
+
+		if ( ! isset( $form_values['product_id'] ) ) return;
+
+		if ( ! $this->order ) return;
+
+		$params = [
+			'product_id' => $form_values['product_id'],
+			'contribution_id' => $this->order['id'],
+			'quantity' => 1 // FIXME, can this be set via UI?
+		];
+
+		if ( isset( $transdata['data'][$config['product_id'] . '_option'] ) )
+			$params['product_option'] = $transdata['data'][$config['product_id'] . '_option'];
+
+		try {
+			$premium = civicrm_api3( 'ContributionProduct', 'create', $params );
+		} catch ( CiviCRM_API3_Exception $e ) {
+
+		}
+
+	}
+
+	/**
+	 * Track CiviDiscounts.
+	 *
+	 * @since 1.0
+	 * @param array $order The order with it's line items
+	 */
+	public function track_cividiscounts( $order ) {
+
+		if ( ! $order || ! isset( $order['id'] ) ) return;
+
+		if ( ! isset( $this->plugin->cividiscount ) ) return;
+
+		if ( empty( $this->plugin->processors->processors['participant']->discounts_used ) && ( empty( $this->plugin->processors->processors['participant']->price_field_refs  ) || empty( $this->plugin->processors->processors['participant']->price_field_option_refs ) ) )
+			return;
+
+		$price_field_refs = $this->plugin->processors->processors['participant']->price_field_refs;
+		$price_field_option_refs = $this->plugin->processors->processors['participant']->price_field_option_refs;
+		$discounts_used = $this->plugin->processors->processors['participant']->discounts_used;
+
+		$price_field_option_refs = array_reduce( $price_field_option_refs, function( $refs, $ref ) {
+			$refs[$ref['processor_id']] = $ref['field_id'];
+			return $refs;
+		}, [] );
+
+		$participant_ids = array_reduce( $order['line_items'], function( $ids, $item ) {
+			if ( $item['entity_table'] == 'civicrm_participant' ) {
+				$ids[] = $item['entity_id'];
+			}
+			return $ids;
+		}, [] );
+
+		$participant_items = array_reduce( $order['line_items'], function( $items, $item ) {
+			if ( $item['entity_table'] == 'civicrm_participant' ) {
+				$items[$item['entity_id']] = $item;
+			}
+			return $items;
+		}, [] );
+
+		$participants = civicrm_api3( 'Participant', 'get', [
+			'id' => [ 'IN' => $participant_ids ],
+			'options' => [ 'limit' => 0 ]
+		] );
+
+		$participants = array_reduce( $participants['values'], function( $participants, $participant ) {
+			$participants[] = $participant;
+			return $participants;
+		}, [] );
+
+		$refs = array_merge( $price_field_refs, $price_field_option_refs );
+
+		$transient = $this->plugin->transient->get();
+
+		array_map( function( $processor_id, $field_id ) use ( $discounts_used, $transient, $order, $participants, $participant_items ) {
+
+			$discount = isset( $discounts_used[$field_id] ) ? $discounts_used[$field_id] : false;
+
+			if ( ! $discount ) return;
+
+			$processor_id = $this->plugin->processors->processors['participant']->parse_processor_id( $processor_id );
+
+			$event_id = $transient->events->$processor_id->event_id;
+
+			$participant = array_filter( $participants, function( $participant ) use ( $event_id ) {
+				return $participant['event_id'] == $event_id;
+			} );
+
+			$participant = array_pop( $participant );
+
+			if ( ! $participant ) return;
+
+			try {
+				$discount_track = civicrm_api3( 'DiscountTrack', 'create', [
+					'item_id' => $discount['id'],
+					'contact_id' => $order['contact_id'],
+					'contribution_id' => $order['id'],
+					'entity_table' => $participant_items[$participant['id']]['entity_table'],
+					'entity_id' => $participant['id'],
+					'description' => [ $participant_items[$participant['id']]['label'] ]
+				] );
+			} catch ( CiviCRM_API3_Exception $e ) {
+				Civi::log()->debug( 'Unable to track discount ' . $discount['code'] . ' for contribution id ' . $order['id'] );
+			}
+
+		}, array_keys( $refs ), $refs );
 
 	}
 
@@ -407,11 +537,9 @@ class CiviCRM_Caldera_Forms_Order_Processor {
 	 * previous membership of the same type.
 	 *
 	 * @since 0.4.4
-	 * @param array $config Processor configuration
 	 * @param array $form Form configuration
-	 * @param string $processid The process id
 	 */
-	function preserve_membership_join_date( $config, $form, $processid ) {
+	function preserve_membership_join_date( $form ) {
 		
 		$transient = $this->plugin->transient->get();
 		
@@ -476,7 +604,6 @@ class CiviCRM_Caldera_Forms_Order_Processor {
 			}
 		}
 
-		return $form;
 	}
 
 	/**
@@ -600,6 +727,25 @@ class CiviCRM_Caldera_Forms_Order_Processor {
 				Civi::log()->debug( 'Unable to send confirmation email for Contribution id ' . $order['id'] );
 			}
 		}
+	}
+
+	/**
+	 * Order has participants.
+	 *
+	 * @since 1.0
+	 * @param array $form_values The submitted values
+	 * @return bool $has_participant
+	 */
+	public function has_participant( $form_values ) {
+
+		if ( ! is_array( $form_values ) || ! isset( $form_values['line_items'] ) ) return false;
+
+		$participant_line_items = array_filter( $form_values['line_items'], function( $line_item ) {
+			return $line_item['line_item'][0]['entity_table'] === 'civicrm_participant';
+		} );
+
+		return ! empty( $participant_line_items ) ? true : false;
+
 	}
 
 	/**
