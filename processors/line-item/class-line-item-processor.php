@@ -296,7 +296,7 @@ class CiviCRM_Caldera_Forms_Line_Item_Processor {
 
 			// add tax amount
 			if ( isset( $field_value['tax_amount'] ) && $this->plugin->helper->get_tax_settings()['invoicing'] )
-				$field_value['amount'] += $field_value['tax_amount'];
+				$field_value['line_total'] += $field_value['tax_amount'];
 
 			unset( 
 				$field_value['id'],
